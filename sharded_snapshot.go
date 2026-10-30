@@ -38,8 +38,10 @@ package gloom
 // such a filter still answers every Test correctly by its own geometry. Loading therefore
 // refuses a snapshot whose geometry does not match the destination.
 //
-// Both directions stream through a fixed-size window. A sharded filter sized for a billion
-// items is gigabytes, so nothing here buffers a whole shard or a whole payload.
+// Both directions stream the block words rather than building a second copy of the filter:
+// a sharded filter sized for a billion items is gigabytes. The reader assembles one shard at a
+// time so it can be checksummed before it is applied, and the writer maintains the checksum as
+// it streams, so neither needs a full payload in memory.
 
 import (
 	"bufio"
@@ -53,6 +55,7 @@ import (
 const (
 	// shardedSnapshotVersion identifies the on-disk layout. It is separate from
 	// serializeVersion so the single-filter and sharded formats can change independently.
+	//
 	shardedSnapshotVersion byte = 1
 
 	// shardedMaxShards bounds the shard count accepted from a snapshot. ShardedAtomicFilter
@@ -138,11 +141,13 @@ func (f *ShardedAtomicFilter) WriteSnapshot(w io.Writer) error {
 		return fmt.Errorf("writing sharded snapshot header: %w", err)
 	}
 
-	// Blocks go out through a fixed-size window for the same reason the reader uses one: a
-	// shard is large enough that buffering one to checksum it would add a copy of the filter's
-	// own memory at snapshot time.
+	// Blocks go out through a fixed-size window rather than a whole shard: the writer only
+	// reads blocks, so it can checksum and emit them as it goes without a second allocation
+	// the size of a shard. The window is the chunk size; BlockWords*8 (64 bytes) would be the
+	// size of a single block and would make every write a one-block syscall through the
+	// buffered writer.
 	const chunk = 1 << 20
-	buf := make([]byte, min(chunk, BlockWords*8))
+	buf := make([]byte, chunk)
 	hash := crc32.New(crc32cTable)
 	for i, shard := range f.shards {
 		hash.Reset()
@@ -188,10 +193,12 @@ func (f *ShardedAtomicFilter) WriteSnapshot(w io.Writer) error {
 //   - no interleaving of the two can invalidate either,
 //   - merging the same snapshot twice is idempotent.
 //
-// f is left unmodified on failure. The header and geometry are validated before anything is
-// merged, and each shard's checksum is verified before that shard's bits are applied, so a
-// caller that gets an error can fall back to filling the filter another way without first
-// discarding what it already has.
+// f is left with only the snapshot's true bits on failure. The header and geometry are
+// validated before anything is merged, and each shard's checksum is verified before that
+// shard's bits are applied, so a failure can leave some verified shards applied but never a
+// damaged one. A caller that gets an error can therefore fall back to filling the filter
+// another way without discarding what it already has, and without clearing anything: bits
+// cannot be cleared, and every bit present is one the snapshot actually holds.
 //
 // The item count advances by the snapshot's count so that EstimatedFalsePositiveRate remains
 // meaningful. Items present in both are counted twice, matching what Count does when the same
@@ -210,6 +217,9 @@ func (f *ShardedAtomicFilter) MergeSnapshot(r io.Reader) error {
 	}
 	if h.NumShards == 0 || h.NumShards > shardedMaxShards {
 		return fmt.Errorf("%w: shard count %d out of range", ErrSnapshotCorrupt, h.NumShards)
+	}
+	if h.NumShards != f.numShards {
+		return fmt.Errorf("%w: snapshot has %d shards, filter has %d", ErrSnapshotGeometry, h.NumShards, f.numShards)
 	}
 	h.NumBlocks = make([]uint64, h.NumShards)
 	h.K = make([]uint32, h.NumShards)
@@ -232,9 +242,6 @@ func (f *ShardedAtomicFilter) MergeSnapshot(r io.Reader) error {
 		return err
 	}
 
-	if h.NumShards != f.numShards {
-		return fmt.Errorf("%w: snapshot has %d shards, filter has %d", ErrSnapshotGeometry, h.NumShards, f.numShards)
-	}
 	for i, shard := range f.shards {
 		if h.NumBlocks[i] != shard.numBlocks || h.K[i] != shard.k {
 			return fmt.Errorf("%w: shard %d is %d blocks k=%d, filter is %d blocks k=%d",
@@ -242,36 +249,37 @@ func (f *ShardedAtomicFilter) MergeSnapshot(r io.Reader) error {
 		}
 	}
 
-	// A fixed-size window keeps memory flat while blocks are copied into the filter.
-	const chunk = 1 << 20
-	scratch := make([]byte, min(chunk, BlockWords*8))
+	// Blocks are applied one shard at a time, and only after that shard's checksum matches.
+	// OR is not undoable: once bits are set they cannot be cleared, so a shard applied before
+	// being verified would stay in the filter and survive the caller's scan fallback, which
+	// only adds true positives over it. That would leave a permanently over-full shard, so
+	// verification comes first even though it means holding one shard's bytes in memory.
+	//
+	// A shard is NumBlocks*64 bytes, which is a fraction of the filter: the destination filter
+	// is already allocated, and one extra shard buffer is bounded by that same order.
 	hash := crc32.New(crc32cTable)
 	for i, shard := range f.shards {
+		shardBytes := int64(shard.numBlocks) * BlockWords * 8
+		buf := make([]byte, shardBytes)
+		if _, err := io.ReadFull(br, buf); err != nil {
+			return fmt.Errorf("%w: reading shard %d: %w", ErrSnapshotCorrupt, i, err)
+		}
 		hash.Reset()
-		remaining := int64(shard.numBlocks) * BlockWords * 8
-		// wordBase tracks the destination word, which advances across windows.
-		var wordBase int64
-		for remaining > 0 {
-			n := min(remaining, int64(len(scratch)))
-			buf := scratch[:n]
-			if _, err := io.ReadFull(br, buf); err != nil {
-				return fmt.Errorf("%w: reading shard %d: %w", ErrSnapshotCorrupt, i, err)
-			}
-			if _, err := hash.Write(buf); err != nil {
-				return fmt.Errorf("%w: checksumming shard %d: %w", ErrSnapshotCorrupt, i, err)
-			}
-			for off := int64(0); off+8 <= n; off += 8 {
-				shard.blocks[wordBase+off/8].Or(binary.LittleEndian.Uint64(buf[off : off+8]))
-			}
-			wordBase += n / 8
-			remaining -= n
+		if _, err := hash.Write(buf); err != nil {
+			return fmt.Errorf("%w: checksumming shard %d: %w", ErrSnapshotCorrupt, i, err)
 		}
 		var sum [4]byte
 		if _, err := io.ReadFull(br, sum[:]); err != nil {
 			return fmt.Errorf("%w: reading shard %d checksum: %w", ErrSnapshotCorrupt, i, err)
 		}
 		if got := hash.Sum32(); got != binary.LittleEndian.Uint32(sum[:]) {
+			// Nothing from this shard has been applied, and every earlier shard was
+			// verified before it was applied, so the filter holds only the snapshot's
+			// true bits. A caller can safely fall back to scanning over it.
 			return fmt.Errorf("%w: shard %d checksum mismatch", ErrSnapshotCorrupt, i)
+		}
+		for off := int64(0); off+8 <= shardBytes; off += 8 {
+			shard.blocks[off/8].Or(binary.LittleEndian.Uint64(buf[off : off+8]))
 		}
 	}
 

@@ -203,6 +203,47 @@ func TestShardedSnapshotRejectsCorruption(t *testing.T) {
 	}
 }
 
+// TestShardedSnapshotCorruptShardIsNotApplied covers the case where the damaged shard comes
+// first. Bits cannot be cleared, so a shard merged before its checksum is verified stays in the
+// filter permanently, and the caller's scan fallback only adds true positives on top of it. That
+// would leave an over-full shard for the life of the process while the caller believes it fell
+// back cleanly. Nothing from a shard may be applied until that shard is verified.
+func TestShardedSnapshotCorruptShardIsNotApplied(t *testing.T) {
+	const numShards = 4
+	src := NewShardedAtomic(1_000, 0.001, numShards)
+	items := make([]string, 5_000)
+	for i := range items {
+		items[i] = "actor" + strconv.Itoa(i) + "|subject" + strconv.Itoa(i)
+		src.AddString(items[i])
+	}
+
+	var buf bytes.Buffer
+	if err := src.WriteSnapshot(&buf); err != nil {
+		t.Fatalf("WriteSnapshot: %v", err)
+	}
+
+	// Damaging a byte in shard 0's blocks must fail its checksum. Shard 0 sits immediately
+	// after the header, so corrupting a byte there cannot touch any other shard.
+	headerLen := 1 + 8 + 8 + 8*numShards + 4*numShards
+	data := flipByte(buf.Bytes(), headerLen+16)
+
+	dst := NewShardedAtomic(1_000, 0.001, numShards)
+	if err := dst.MergeSnapshot(bytes.NewReader(data)); !errors.Is(err, ErrSnapshotCorrupt) {
+		t.Fatalf("MergeSnapshot error = %v, want ErrSnapshotCorrupt", err)
+	}
+
+	// A failed load must leave the filter as it was: no bits from the unverified shard, and in
+	// this case nothing at all, since the damaged shard is the first one read.
+	for _, item := range items {
+		if dst.TestString(item) {
+			t.Fatalf("%q present after a failed load: bits from an unverified shard were applied", item)
+		}
+	}
+	if got := dst.Count(); got != 0 {
+		t.Fatalf("count after failed load = %d, want 0", got)
+	}
+}
+
 // TestShardedSnapshotSurvivesStreamingBoundaries drives a filter large enough that both the
 // writer and reader cross their fixed-size windows, since the offset arithmetic for partial
 // windows only shows up at that size.
