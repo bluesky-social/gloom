@@ -6,6 +6,16 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
+// A serialized snapshot stores bit positions, not keys, so it is only meaningful to a build
+// that computes the same positions. The functions and tables that decide them are the hash
+// function, hashSplitSharded, shardIndexFromHash, reduceRange, foldIntra, and the prime
+// partitions in params.go.
+//
+// If any of those are changed, every key moves to a different bit: an old snapshot then loads
+// without error while placing no key where it needs to be, and every lookup reports a false
+// negative for entries the snapshot contains. If any of those are changed, bump
+// ShardedSnapshotFormat in sharded_snapshot.go, and expect TestKeyPositionIsStable to fail.
+
 // We hash each key once with xxh3's 128-bit variant and split the result into two
 // independent halves:
 //

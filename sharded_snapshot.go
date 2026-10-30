@@ -53,10 +53,16 @@ import (
 )
 
 const (
-	// shardedSnapshotVersion identifies the on-disk layout. It is separate from
-	// serializeVersion so the single-filter and sharded formats can change independently.
+	// ShardedSnapshotFormat identifies the on-disk layout AND the key-to-position mapping.
+	// It is separate from serializeVersion so the single-filter and sharded formats can
+	// change independently.
 	//
-	shardedSnapshotVersion byte = 1
+	// Bump this whenever a change alters where a key lands, which is a wider set of changes
+	// than the byte layout alone: see the warning at the top of hash.go. A reader refuses any
+	// format it does not know rather than attempting a best-effort parse, because a snapshot
+	// whose layout or hashing is ambiguous cannot be told apart from a valid one after the
+	// fact, and guessing wrong means false negatives.
+	ShardedSnapshotFormat byte = 1
 
 	// shardedMaxShards bounds the shard count accepted from a snapshot. ShardedAtomicFilter
 	// rounds shard counts up to a power of two and real deployments use roughly one per core,
@@ -85,7 +91,7 @@ type shardedSnapshotHeader struct {
 // validate checks that the header is internally consistent before any of it is used to size an
 // allocation or copy into a filter.
 func (h *shardedSnapshotHeader) validate() error {
-	if h.Version != shardedSnapshotVersion {
+	if h.Version != ShardedSnapshotFormat {
 		return fmt.Errorf("%w: unsupported version %d", ErrSnapshotCorrupt, h.Version)
 	}
 	if h.NumShards == 0 || h.NumShards > shardedMaxShards {
@@ -124,7 +130,7 @@ func (f *ShardedAtomicFilter) WriteSnapshot(w io.Writer) error {
 	bw := bufio.NewWriterSize(w, 1<<20)
 
 	header := make([]byte, 1+8+8+8*f.numShards+4*f.numShards)
-	header[0] = shardedSnapshotVersion
+	header[0] = ShardedSnapshotFormat
 	binary.LittleEndian.PutUint64(header[1:9], f.numShards)
 	binary.LittleEndian.PutUint64(header[9:17], f.Count())
 
