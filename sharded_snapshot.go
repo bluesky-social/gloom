@@ -84,13 +84,14 @@ const (
 	shardedSnapshotBlockCountBytes = 8
 	shardedSnapshotHashCountBytes  = 4
 	shardedSnapshotChecksumBytes   = 4
+
+	shardedSnapshotFixedHeaderBytes = shardedSnapshotVersionBytes + shardedSnapshotShardCountBytes + shardedSnapshotItemCountBytes
 )
 
 // shardedSnapshotHeaderSize returns the encoded header length for numShards shards.
 func shardedSnapshotHeaderSize(numShards uint64) int64 {
-	fixed := shardedSnapshotVersionBytes + shardedSnapshotShardCountBytes + shardedSnapshotItemCountBytes
 	perShard := shardedSnapshotBlockCountBytes + shardedSnapshotHashCountBytes
-	return int64(fixed) + int64(numShards)*int64(perShard)
+	return int64(shardedSnapshotFixedHeaderBytes) + int64(numShards)*int64(perShard)
 }
 
 // shardedSnapshotShardPayloadSize returns the encoded length of one shard's block words.
@@ -275,14 +276,16 @@ func (f *ShardedAtomicFilter) writeSnapshot(w io.Writer) error {
 //   - every item in the snapshot is present afterwards,
 //   - every item added concurrently is present afterwards,
 //   - no interleaving of the two can invalidate either,
-//   - merging the same snapshot twice is idempotent.
+//   - merging the same snapshot twice sets no new bits, though the item count advances again.
 //
-// f is left with only the snapshot's true bits on failure. The header and geometry are
-// validated before anything is merged, and each shard's checksum is verified before that
-// shard's bits are applied, so a failure can leave some verified shards applied but never a
-// damaged one. A caller that gets an error can therefore fall back to filling the filter
-// another way without discarding what it already has, and without clearing anything: bits
-// cannot be cleared, and every bit present is one the snapshot actually holds.
+// A failure never adds a bit to f that the snapshot does not genuinely hold. The header and
+// geometry are validated before anything is merged, and each shard's checksum is verified
+// before that shard's bits are applied, so a failure can leave some verified shards applied
+// but never a damaged one. A caller that gets an error can therefore fall back to filling the
+// filter another way without discarding what it already has, and without clearing anything:
+// bits cannot be cleared, and every bit present is one the snapshot actually holds. On
+// failure the item count is left unchanged even if some shards were applied, so Count
+// undercounts rather than overcounts.
 //
 // The item count advances by the snapshot's count so that EstimatedFalsePositiveRate remains
 // meaningful. Items present in both are counted twice, matching what Count does when the same
@@ -290,7 +293,7 @@ func (f *ShardedAtomicFilter) writeSnapshot(w io.Writer) error {
 func (f *ShardedAtomicFilter) MergeSnapshot(r io.Reader) error {
 	br := bufio.NewReaderSize(r, 1<<20)
 
-	head := make([]byte, 17)
+	head := make([]byte, shardedSnapshotFixedHeaderBytes)
 	if _, err := io.ReadFull(br, head); err != nil {
 		return fmt.Errorf("%w: reading header: %w", ErrSnapshotCorrupt, err)
 	}
