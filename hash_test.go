@@ -1,8 +1,8 @@
 package gloom
 
 import (
-	"fmt"
 	"math"
+	"strconv"
 	"testing"
 )
 
@@ -35,8 +35,9 @@ func TestReduceRangeUniformity(t *testing.T) {
 	for _, n := range []uint64{100_000, 200_000} {
 		counts := make([]uint64, n)
 		const samples = 20_000_000
+		// Convert with strconv rather than fmt; Sprintf cost several seconds under -race.
 		for i := range samples {
-			h := hashRawString128(fmt.Sprintf("uniformity-%d", i))
+			h := hashRawString128(strconv.Itoa(i))
 			counts[reduceRange(h.Hi, n)]++
 		}
 		// Chi-square against uniform expectation.
