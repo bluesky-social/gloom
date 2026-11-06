@@ -2,7 +2,9 @@ package gloom
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"strconv"
 	"sync"
 	"testing"
@@ -32,8 +34,9 @@ func TestShardedSnapshotRoundtrip(t *testing.T) {
 		t.Fatalf("MergeSnapshot: %v", err)
 	}
 
-	// A snapshot is only useful if it carries every item: one missing key becomes a missing
-	// block/mute check on a read path that treats a false result as proof of absence.
+	// A snapshot is only useful if it carries every item: a missing key is indistinguishable
+	// from one that was never added, so a caller that treats a false result as proof of absence
+	// would act on a wrong answer.
 	for _, item := range items {
 		if !dst.TestString(item) {
 			t.Fatalf("false negative after snapshot load for %q", item)
@@ -272,6 +275,169 @@ func TestShardedSnapshotSurvivesStreamingBoundaries(t *testing.T) {
 			t.Fatalf("false negative after streaming load for %q", item)
 		}
 	}
+}
+
+// TestSnapshotSize checks that the accessor reports the exact encoded length for both writers and
+// that the length depends only on the filter's geometry, not on how many items it holds.
+func TestSnapshotSize(t *testing.T) {
+	src := NewShardedAtomic(10_000, 0.001, 4)
+
+	var empty bytes.Buffer
+	if err := src.WriteSnapshot(&empty); err != nil {
+		t.Fatalf("WriteSnapshot: %v", err)
+	}
+	if got, want := int64(empty.Len()), src.SnapshotSize(); got != want {
+		t.Fatalf("WriteSnapshot wrote %d bytes, SnapshotSize reports %d", got, want)
+	}
+
+	for i := range 1_000 {
+		src.AddString("size|" + strconv.Itoa(i))
+	}
+	var full bytes.Buffer
+	if err := src.WriteSnapshotWithReplay(&full); err != nil {
+		t.Fatalf("WriteSnapshotWithReplay: %v", err)
+	}
+	if got, want := int64(full.Len()), src.SnapshotSize(); got != want {
+		t.Fatalf("WriteSnapshotWithReplay wrote %d bytes, SnapshotSize reports %d", got, want)
+	}
+	if empty.Len() != full.Len() {
+		t.Fatalf("encoded length changed with item count: %d -> %d", empty.Len(), full.Len())
+	}
+}
+
+// TestShardedSnapshotEncodingIsStable pins the encoded bytes of a small fixture: the header field
+// order and widths, each shard's block words in shard order, and the CRC-32C trailer after each
+// shard. It also proves a quiescent filter encodes identically through both public writers, so the
+// replay-aware path cannot drift from the standalone one.
+func TestShardedSnapshotEncodingIsStable(t *testing.T) {
+	src := NewShardedAtomic(200, 0.01, 2)
+	for _, item := range []string{"alpha|1", "beta|2", "gamma|3"} {
+		src.AddString(item)
+	}
+
+	var quiet bytes.Buffer
+	if err := src.WriteSnapshot(&quiet); err != nil {
+		t.Fatalf("WriteSnapshot: %v", err)
+	}
+	var replay bytes.Buffer
+	if err := src.WriteSnapshotWithReplay(&replay); err != nil {
+		t.Fatalf("WriteSnapshotWithReplay: %v", err)
+	}
+	if !bytes.Equal(quiet.Bytes(), replay.Bytes()) {
+		t.Fatalf("quiescent filter encoded differently through the two writers")
+	}
+
+	// Assemble the expected bytes from the documented layout without going through the encoder,
+	// so a change to field order, width, or checksum placement fails here.
+	numShards := src.NumShards()
+	blocksPerShard := src.NumBlocks() / numShards
+	want := make([]byte, 0, src.SnapshotSize())
+	want = append(want, ShardedSnapshotFormat)
+	want = binary.LittleEndian.AppendUint64(want, numShards)
+	want = binary.LittleEndian.AppendUint64(want, src.Count())
+	for range numShards {
+		want = binary.LittleEndian.AppendUint64(want, blocksPerShard)
+	}
+	for range numShards {
+		want = binary.LittleEndian.AppendUint32(want, src.K())
+	}
+	for _, shard := range src.shards {
+		payloadStart := len(want)
+		for word := range shard.blocks {
+			want = binary.LittleEndian.AppendUint64(want, shard.blocks[word].Load())
+		}
+		sum := crc32.Checksum(want[payloadStart:], crc32cTable)
+		want = binary.LittleEndian.AppendUint32(want, sum)
+	}
+
+	if !bytes.Equal(quiet.Bytes(), want) {
+		t.Fatalf("encoded snapshot does not match the documented layout")
+	}
+	if got, size := int64(len(want)), src.SnapshotSize(); got != size {
+		t.Fatalf("laid-out length %d disagrees with SnapshotSize %d", got, size)
+	}
+}
+
+// TestSnapshotWithReplayPreservesCompletedAdds covers the guarantee the replay-aware writer makes:
+// every addition that completed before the call began is in the output, even though new additions
+// keep landing while it serializes. Items added after the call starts may be absent, which is
+// exactly why the caller replays from its own boundary.
+func TestSnapshotWithReplayPreservesCompletedAdds(t *testing.T) {
+	const items = 5_000
+	src := NewShardedAtomic(4_000_000, 0.0001, 2)
+	for i := range items {
+		src.AddString("before|" + strconv.Itoa(i))
+	}
+
+	// Block once roughly one flush has gone out, so the write is genuinely mid-serialization
+	// and not merely waiting to start.
+	writer := newBlockingWriter(1 << 20)
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- src.WriteSnapshotWithReplay(writer) }()
+
+	select {
+	case <-writer.blocked:
+	case err := <-writeDone:
+		t.Fatalf("snapshot completed without blocking: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 2_000 {
+			src.AddString("live|" + strconv.Itoa(i))
+		}
+	}()
+	wg.Wait()
+	close(writer.release)
+
+	if err := <-writeDone; err != nil {
+		t.Fatalf("WriteSnapshotWithReplay: %v", err)
+	}
+
+	dst := NewShardedAtomic(4_000_000, 0.0001, 2)
+	if err := dst.MergeSnapshot(bytes.NewReader(writer.bytes())); err != nil {
+		t.Fatalf("MergeSnapshot: %v", err)
+	}
+	for i := range items {
+		if !dst.TestString("before|" + strconv.Itoa(i)) {
+			t.Fatalf("addition %d completed before the write but is absent from the snapshot", i)
+		}
+	}
+}
+
+// blockingWriter collects a snapshot and, once limit bytes have been written, parks until release
+// is closed. A test uses it to open a window in which additions land while serialization is
+// already underway.
+type blockingWriter struct {
+	limit   int
+	blocked chan struct{}
+	release chan struct{}
+
+	pause sync.Once
+	buf   bytes.Buffer
+}
+
+func newBlockingWriter(limit int) *blockingWriter {
+	return &blockingWriter{
+		limit:   limit,
+		blocked: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	if w.buf.Len() >= w.limit {
+		w.pause.Do(func() { close(w.blocked) })
+		<-w.release
+	}
+	return w.buf.Write(p)
+}
+
+// bytes returns the collected snapshot. It is only valid after the writer has returned.
+func (w *blockingWriter) bytes() []byte {
+	return w.buf.Bytes()
 }
 
 func flipByte(src []byte, idx int) []byte {

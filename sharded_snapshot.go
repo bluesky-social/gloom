@@ -11,12 +11,16 @@ package gloom
 //   - [ShardedAtomicFilter.WriteSnapshot] takes bits out, and therefore requires the caller to
 //     guarantee the filter is quiescent. The precondition is the caller's to enforce; it cannot
 //     be checked here.
+//   - [ShardedAtomicFilter.WriteSnapshotWithReplay] takes bits out of a filter that may still have
+//     writers. It is only sound for a caller that separately replays every addition that could
+//     overlap the write, because an overlapping item can be captured with only some of its bits.
 //   - [ShardedAtomicFilter.MergeSnapshot] puts bits in. Bloom filters only ever set bits, so a
 //     union cannot damage an item that is already present, and merging is safe while the filter
 //     is being written to.
 //
-// The asymmetry is the point: removing bits is unsafe, adding bits is not, and only the latter
-// can be offered without a precondition.
+// The asymmetry is the point: removing bits is unsafe, adding bits is not. So WriteSnapshot asks
+// the caller to stop its writers, WriteSnapshotWithReplay asks the caller to replay anything it
+// could have overlapped, and only MergeSnapshot needs nothing from the caller at all.
 //
 // # Format
 //
@@ -70,6 +74,35 @@ const (
 	// a large allocation.
 	shardedMaxShards = uint64(1) << 20
 )
+
+// Encoded field widths. They are named so the encoder and SnapshotSize compute the layout from
+// one description of it rather than repeating offsets or sizes.
+const (
+	shardedSnapshotVersionBytes    = 1
+	shardedSnapshotShardCountBytes = 8
+	shardedSnapshotItemCountBytes  = 8
+	shardedSnapshotBlockCountBytes = 8
+	shardedSnapshotHashCountBytes  = 4
+	shardedSnapshotChecksumBytes   = 4
+)
+
+// shardedSnapshotHeaderSize returns the encoded header length for numShards shards.
+func shardedSnapshotHeaderSize(numShards uint64) int64 {
+	fixed := shardedSnapshotVersionBytes + shardedSnapshotShardCountBytes + shardedSnapshotItemCountBytes
+	perShard := shardedSnapshotBlockCountBytes + shardedSnapshotHashCountBytes
+	return int64(fixed) + int64(numShards)*int64(perShard)
+}
+
+// shardedSnapshotShardPayloadSize returns the encoded length of one shard's block words.
+func shardedSnapshotShardPayloadSize(numBlocks uint64) int64 {
+	return int64(numBlocks) * BlockWords * 8
+}
+
+// shardedSnapshotShardSize returns the encoded length of one shard: its block words plus the
+// checksum written after them.
+func shardedSnapshotShardSize(numBlocks uint64) int64 {
+	return shardedSnapshotShardPayloadSize(numBlocks) + shardedSnapshotChecksumBytes
+}
 
 var (
 	// ErrSnapshotGeometry is returned when a snapshot does not describe the destination
@@ -127,21 +160,66 @@ func (h *shardedSnapshotHeader) validate() error {
 // Each shard is checksummed separately so that a reader can reject a damaged shard without
 // first consuming the entire payload.
 func (f *ShardedAtomicFilter) WriteSnapshot(w io.Writer) error {
+	return f.writeSnapshot(w)
+}
+
+// WriteSnapshotWithReplay serializes the filter to w while it may still have writers.
+//
+// The contract has two parts, and both are the caller's responsibility:
+//
+//   - Every addition that must survive must have completed before this call begins. "Completed"
+//     means the addition is fully applied and the caller has moved its own replay boundary past
+//     it, so this call cannot miss it.
+//   - The caller must replay every addition that could overlap this call before treating a
+//     negative result from the loaded filter as proof of absence. An overlapping addition may be
+//     absent from the output, fully present, or present with only some of its k bits set.
+//
+// Each block word is read atomically, so every word in the output holds a value some writer left
+// there. The output therefore contains only bits that were genuinely set, never a value assembled
+// from a partial write. Bits an overlapping addition contributed are a bonus: an item is either
+// complete or incomplete, and replay repairs the incomplete case.
+//
+// The encoded bytes are identical to [ShardedAtomicFilter.WriteSnapshot]; only the precondition
+// differs. Prefer WriteSnapshot when writers can be stopped, because a caller that does not
+// replay overlapping additions will observe false negatives from this output.
+func (f *ShardedAtomicFilter) WriteSnapshotWithReplay(w io.Writer) error {
+	return f.writeSnapshot(w)
+}
+
+// SnapshotSize returns the exact number of bytes [ShardedAtomicFilter.WriteSnapshot] and
+// [ShardedAtomicFilter.WriteSnapshotWithReplay] write.
+//
+// The size is fixed by the filter's geometry and does not change as items are added, so a caller
+// that wraps snapshots in its own framing can delimit them without copying this package's layout
+// arithmetic.
+func (f *ShardedAtomicFilter) SnapshotSize() int64 {
+	total := shardedSnapshotHeaderSize(f.numShards)
+	for _, shard := range f.shards {
+		total += shardedSnapshotShardSize(shard.numBlocks)
+	}
+	return total
+}
+
+// writeSnapshot encodes the filter to w. Both public write methods share it so the two cannot
+// disagree about either the layout or the buffering.
+func (f *ShardedAtomicFilter) writeSnapshot(w io.Writer) error {
 	bw := bufio.NewWriterSize(w, 1<<20)
 
-	header := make([]byte, 1+8+8+8*f.numShards+4*f.numShards)
-	header[0] = ShardedSnapshotFormat
-	binary.LittleEndian.PutUint64(header[1:9], f.numShards)
-	binary.LittleEndian.PutUint64(header[9:17], f.Count())
-
-	off := 17
+	header := make([]byte, shardedSnapshotHeaderSize(f.numShards))
+	off := 0
+	header[off] = ShardedSnapshotFormat
+	off += shardedSnapshotVersionBytes
+	binary.LittleEndian.PutUint64(header[off:], f.numShards)
+	off += shardedSnapshotShardCountBytes
+	binary.LittleEndian.PutUint64(header[off:], f.Count())
+	off += shardedSnapshotItemCountBytes
 	for _, shard := range f.shards {
-		binary.LittleEndian.PutUint64(header[off:off+8], shard.numBlocks)
-		off += 8
+		binary.LittleEndian.PutUint64(header[off:], shard.numBlocks)
+		off += shardedSnapshotBlockCountBytes
 	}
 	for _, shard := range f.shards {
-		binary.LittleEndian.PutUint32(header[off:off+4], shard.k)
-		off += 4
+		binary.LittleEndian.PutUint32(header[off:], shard.k)
+		off += shardedSnapshotHashCountBytes
 	}
 	if _, err := bw.Write(header); err != nil {
 		return fmt.Errorf("writing sharded snapshot header: %w", err)
@@ -157,7 +235,7 @@ func (f *ShardedAtomicFilter) WriteSnapshot(w io.Writer) error {
 	hash := crc32.New(crc32cTable)
 	for i, shard := range f.shards {
 		hash.Reset()
-		remaining := int64(shard.numBlocks) * BlockWords * 8
+		remaining := shardedSnapshotShardPayloadSize(shard.numBlocks)
 		var wordBase int64
 		for remaining > 0 {
 			n := min(remaining, int64(len(buf)))
